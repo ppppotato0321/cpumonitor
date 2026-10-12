@@ -1,0 +1,9 @@
+Package: com.local.cpumonitor
+Name: cpumonitor
+Version: 0.1
+Architecture: iphoneos-arm64
+Description: Jailbreak CPU / power monitor for A12 (iPhone XS Max, iOS 12.3.1)
+Maintainer: local
+Author: local
+Section: Utilities
+Depends: mobilesubstrate
