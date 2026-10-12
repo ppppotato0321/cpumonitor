@@ -1,0 +1,35 @@
+name: build-cpumonitor-deb
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'cpumonitor/**'
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    env:
+      THEOS: ${{ github.workspace }}/theos
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Theos
+        run: |
+          git clone --recursive https://github.com/theos/theos.git $THEOS
+
+      - name: Build
+        working-directory: cpumonitor
+        run: |
+          make package FINAL=make
+          find . -name "*.deb"
+
+      - name: Upload deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpumonitor-deb
+          path: cpumonitor/**/*.deb
+          if-no-found: warn
