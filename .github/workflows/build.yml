@@ -20,6 +20,8 @@ jobs:
       - name: Install Theos
         run: |
           git clone --recursive https://github.com/theos/theos.git $THEOS
+          brew install ldid
+
 
       - name: Build
         run: |
