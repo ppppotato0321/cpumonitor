@@ -1,18 +1,5 @@
 // cpumonitor.m
 // A12 / iPhone XS Max / iOS 12.3.1 jailbreak CPU & power monitor
-//
-// Build: theos `make package` (or `make`), run on device as root:
-//   sudo cpumonitor
-//
-// What it reads:
-//   - Per-core CPU utilization          (host_processor_info, always works)
-//   - Battery voltage / current / temp  (IOKit AppleSmartBattery, stable on iOS)
-//   - Whole-device power in Watts       (= |Amperage| * Voltage / 1e6, real silicon reading)
-//   - CPU max nominal frequency         (sysctl hw.cpufrequency_max)
-//   - Real-time P/E cluster freq        (IOReport private framework, best-effort)
-//
-// NOTE: iOS exposes no per-core power sensor (no RAPL). "CPU power" is therefore
-// estimated from the whole-battery draw + DVFS table, never read directly.
 
 #import <Foundation/Foundation.h>
 #import <IOKit/IOKitLib.h>
@@ -24,20 +11,13 @@
 #import <stdlib.h>
 #import <string.h>
 
-#pragma mark - IOReport dynamic loading (private framework)
+#pragma mark - IOReport dynamic loading
 
 typedef CFTypeRef IOReportSubscriptionRef;
-typedef CFTypeRef IOReportChannelRef;
 
 static CFArrayRef  (*p_IOReportCopyChannelsInGroup)(CFStringRef group, CFStringRef subgroup, uint64_t, uint64_t, uint64_t options) = NULL;
 static IOReportSubscriptionRef (*p_IOReportCreateSubscription)(void*, CFArrayRef chan, uint64_t* outFlags) = NULL;
 static CFArrayRef  (*p_IOReportIterate)(IOReportSubscriptionRef sub, uint64_t* idx) = NULL;
-static CFStringRef (*p_IOReportChannelGetChannelName)(IOReportChannelRef ch) = NULL;
-static CFStringRef (*p_IOReportChannelGetGroup)(IOReportChannelRef ch) = NULL;
-static CFStringRef (*p_IOReportChannelGetSubGroup)(IOReportChannelRef ch) = NULL;
-static int64_t     (*p_IOReportChannelGetScale)(IOReportChannelRef ch) = NULL;
-static CFStringRef (*p_IOReportChannelGetUnit)(IOReportChannelRef ch) = NULL;
-static void        (*p_IOReportIterateReset)(IOReportSubscriptionRef sub) = NULL;
 
 static BOOL loadIOReport(void) {
     static BOOL tried = NO;
@@ -50,37 +30,24 @@ static BOOL loadIOReport(void) {
     p_IOReportCopyChannelsInGroup = (void*)dlsym(h, "IOReportCopyChannelsInGroup");
     p_IOReportCreateSubscription  = (void*)dlsym(h, "IOReportCreateSubscription");
     p_IOReportIterate             = (void*)dlsym(h, "IOReportIterate");
-    p_IOReportChannelGetChannelName = (void*)dlsym(h, "IOReportChannelGetChannelName");
-    p_IOReportChannelGetGroup     = (void*)dlsym(h, "IOReportChannelGetGroup");
-    p_IOReportChannelGetSubGroup  = (void*)dlsym(h, "IOReportChannelGetSubGroup");
-    p_IOReportChannelGetScale     = (void*)dlsym(h, "IOReportChannelGetScale");
-    p_IOReportChannelGetUnit      = (void*)dlsym(h, "IOReportChannelGetUnit");
-    p_IOReportIterateReset        = (void*)dlsym(h, "IOReportIterateReset");
     ok = (p_IOReportCopyChannelsInGroup && p_IOReportCreateSubscription && p_IOReportIterate);
     return ok;
 }
 
 #pragma mark - IOKit helpers
 
-static id getIOKitProperty(io_service_t service, NSString* key) {
-    id v = nil;
-    CFTypeRef p = IORegistryEntryCreateCFProperty(service, (__bridge CFStringRef)key, kCFAllocatorDefault, 0);
-    if (p) { v = (__bridge id)p; CFRelease(p); }
-    return v;
-}
-
-static int intProp(NSDictionary* props, NSString* key, int fallback) {
-    NSNumber* n = props[key];
-    return n ? [n intValue] : fallback;
-}
-
 static NSDictionary* batteryProperties(void) {
-    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"));
+    io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("AppleSmartBattery"));
     if (!svc) return nil;
     CFMutableDictionaryRef props = NULL;
     IORegistryEntryCreateCFProperties(svc, &props, kCFAllocatorDefault, 0);
     IOObjectRelease(svc);
     return (__bridge_transfer NSDictionary*)props;
+}
+
+static int intProp(NSDictionary* props, NSString* key, int fallback) {
+    NSNumber* n = props[key];
+    return n ? [n intValue] : fallback;
 }
 
 #pragma mark - CPU utilization
@@ -103,7 +70,7 @@ static NSArray<NSValue*>* cpuLoads(void) {
         c.system = loadInfo[i].cpu_ticks[CPU_STATE_SYSTEM];
         c.idle   = loadInfo[i].cpu_ticks[CPU_STATE_IDLE];
         c.nice   = loadInfo[i].cpu_ticks[CPU_STATE_NICE];
-        [arr addValue:[NSValue valueWithBytes:&c objCType:@encode(CoreLoad)]];
+        [arr addObject:[NSValue valueWithBytes:&c objCType:@encode(CoreLoad)]];
     }
     return arr;
 }
@@ -135,35 +102,33 @@ static NSString* sysctlString(const char* name) {
     return [NSString stringWithUTF8String:buf];
 }
 
-#pragma mark - IOReport CPU freq sampling
+#pragma mark - IOReport CPU freq
 
-// Try to build a subscription on "CPU Stats" group and read frequency channels.
-// Returns dictionary: { @"P0": MHz, @"P1": MHz, @"E0".."E3": MHz } or empty dict.
 static NSDictionary* sampleCPUFrequencies(void) {
     NSMutableDictionary* result = [NSMutableDictionary dictionary];
     if (!loadIOReport()) return result;
 
-    // A12: group "CPU Stats", subgroups "P-CORE" and "E-CORE" (older iOS 12 may use "GPU" too)
     NSArray* subgroups = @[@"P-CORE", @"E-CORE", @"Per-Cluster"];
     for (NSString* sg in subgroups) {
         CFArrayRef chans = p_IOReportCopyChannelsInGroup(CFSTR("CPU Stats"), (__bridge CFStringRef)sg, 0, 0, 0);
         if (!chans) continue;
         uint64_t flags = 0;
-        IOReportSubscriptionRef sub = p_IOReportCreateSubscription(NULL, (CFArrayRef)chans, &flags);
+        IOReportSubscriptionRef sub = p_IOReportCreateSubscription(NULL, chans, &flags);
         if (!sub) { CFRelease(chans); continue; }
         uint64_t idx = 0;
         while (true) {
             CFArrayRef samples = p_IOReportIterate(sub, &idx);
             if (!samples) break;
-            // each sample is a dict with channel name + value
-            for (CFTypeRef item in (NSArray*)samples) {
-                if (!CFDictionaryContainsKey(item, CFSTR("IOReport Channel Name"))) continue;
-                CFStringRef chName = CFDictionaryGetValue(item, CFSTR("IOReport Channel Name"));
-                CFNumberRef chVal = CFDictionaryGetValue(item, CFSTR("IOReport Channel Value"));
-                if (!chVal) continue;
+            CFIndex n = CFArrayGetCount(samples);
+            for (CFIndex i = 0; i < n; i++) {
+                CFTypeRef item = CFArrayGetValueAtIndex(samples, i);
+                if (!item || CFGetTypeID(item) != CFDictionaryGetTypeID()) continue;
+                CFDictionaryRef d = (CFDictionaryRef)item;
+                CFStringRef chName = CFDictionaryGetValue(d, CFSTR("IOReport Channel Name"));
+                CFNumberRef chVal  = CFDictionaryGetValue(d, CFSTR("IOReport Channel Value"));
+                if (!chVal || CFGetTypeID(chVal) != CFNumberGetTypeID()) continue;
                 int64_t v = 0;
                 CFNumberGetValue(chVal, kCFNumberSInt64Type, &v);
-                // scale: freq channels usually report in Hz or scaled by 1e6; divide heuristically
                 double mhz = (v > 100000000) ? (v/1000000.0) : (double)v;
                 NSString* key = [NSString stringWithFormat:@"%@/%@", sg, (__bridge NSString*)chName];
                 result[key] = @((int)round(mhz));
@@ -175,7 +140,7 @@ static NSDictionary* sampleCPUFrequencies(void) {
     return result;
 }
 
-#pragma mark - main loop
+#pragma mark - main
 
 int main(int argc, const char* argv[]) {
     @autoreleasepool {
@@ -200,38 +165,34 @@ int main(int argc, const char* argv[]) {
             NSDictionary* batt = batteryProperties();
             NSDictionary* freqs = sampleCPUFrequencies();
 
-            // Battery / whole-device power
             int voltMv   = batt ? intProp(batt, @"Voltage", 0) : 0;
-            int ampMa    = batt ? intProp(batt, @"Amperage", 0) : 0;   // negative = discharging
-            int battTempC10 = batt ? intProp(batt, @"Temperature", 0) : 0; // 0.1°C
+            int ampMa    = batt ? intProp(batt, @"Amperage", 0) : 0;
+            int battTempC10 = batt ? intProp(batt, @"Temperature", 0) : 0;
             int curCap   = batt ? intProp(batt, @"CurrentCapacity", 0) : 0;
             int maxCap   = batt ? intProp(batt, @"MaxCapacity", 0) : 0;
             int designCap= batt ? intProp(batt, @"DesignCapacity", 0) : 0;
             int cycle    = batt ? intProp(batt, @"CycleCount", 0) : 0;
             NSNumber* isCharging = batt[@"IsCharging"];
-            NSNumber* externalPower = batt[@"ExternalChargeCapable"];
 
-            // Whole-device power (W). |amp| is drawn from battery.
             double drawW = fabs((double)ampMa) * (double)voltMv / 1e6;
             double battTempC = battTempC10 / 10.0;
 
-            // Per-core busy %
             NSMutableString* coreLine = [NSMutableString string];
             for (int i = 0; i < (int)currLoad.count; i++) {
                 double p = pctBetween(prevLoad, currLoad, i);
                 [coreLine appendFormat:@" C%d:%5.1f%%", i, p];
             }
 
-            // Build freq line
             NSMutableString* freqLine = [NSMutableString string];
             for (NSString* k in freqs) {
                 [freqLine appendFormat:@"  %@=%@MHz", k, freqs[k]];
             }
-            if (freqLine.length == 0) [freqLine appendString:@"  (IOReport not available; sysctl max=%lldMHz)", maxFreqMHz];
+            if (freqLine.length == 0) {
+                [freqLine appendFormat:@"  (IOReport n/a; sysctl max=%lldMHz)", maxFreqMHz];
+            }
 
-            // Clear screen and print
             printf("\033[2J\033[H");
-            printf("=== cpumonitor  %@  (%@) ===\n", machine, model);
+            printf("=== cpumonitor  %s  (%s) ===\n", machine.UTF8String, model.UTF8String);
             printf("time: %s\n\n", [[NSDate date].description UTF8String]);
 
             printf("-- CPU --\n");
@@ -242,24 +203,22 @@ int main(int argc, const char* argv[]) {
 
             printf("-- Battery / whole-device power --\n");
             printf("voltage       : %d mV\n", voltMv);
-            printf("current       : %d mA  (%@)\n", ampMa,
-                   ampMa < 0 ? @"discharging" : (ampMa > 0 ? @"charging" : @"idle"));
-            printf("power draw    : %.2f W   <-- THIS is the real silicon power reading (whole phone)\n", drawW);
-            printf("battery temp   : %.1f C\n", battTempC);
+            printf("current       : %d mA  (%s)\n", ampMa,
+                   ampMa < 0 ? "discharging" : (ampMa > 0 ? "charging" : "idle"));
+            printf("power draw    : %.2f W   <-- whole-phone silicon reading\n", drawW);
+            printf("battery temp  : %.1f C\n", battTempC);
             printf("capacity      : %d / %d mAh  (design %d mAh)\n", curCap, maxCap, designCap);
             printf("cycle count   : %d\n", cycle);
-            printf("isCharging    : %@\n", isCharging ? (isCharging.boolValue?@"YES":@"NO") : @"?");
+            printf("isCharging    : %s\n", isCharging ? (isCharging.boolValue?"YES":"NO") : "?");
 
             printf("\n-- notes --\n");
-            printf("* CPU has no per-core power sensor on A12; 'power draw' above = whole phone.\n");
-            printf("* To attribute CPU share: use busy%% * freq table * C_eff (see README).\n");
-            printf("* Press Ctrl-C to exit.\n");
+            printf("* No per-core power sensor on A12; 'power draw' = whole phone.\n");
+            printf("* Ctrl-C to exit.\n");
             fflush(stdout);
 
             prevLoad = currLoad;
 
             if (once) break;
-            // Pace to ~1s
             while ([t0 timeIntervalSinceNow] > -1.0) { usleep(50000); }
         }
     }
